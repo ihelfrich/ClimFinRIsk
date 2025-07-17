@@ -312,7 +312,7 @@ class RiskEstimation:
     ) -> Dict[str, float]:
         """Calculate risk metrics for a single asset."""
         asset_value = asset.get('value', 1.0)
-        asset_type = asset.get('asset_type', 'commercial')
+        asset_type = asset.get('type', 'commercial')
         
         hazard_exposure = self._calculate_hazard_exposure(climate_data, scenario)
         
@@ -342,10 +342,14 @@ class RiskEstimation:
         
         for var_name, var_data in climate_data.data_vars.items():
             try:
-                if 'time' in var_data.dims:
-                    mean_exposure = float(var_data.mean().values)
+                if hasattr(var_data, 'values'):
+                    values = var_data.values
+                    if values.ndim > 0:
+                        mean_exposure = float(np.mean(values))
+                    else:
+                        mean_exposure = float(values)
                 else:
-                    mean_exposure = float(var_data.values)
+                    mean_exposure = float(var_data)
                 
                 scenario_multipliers = {
                     'rcp26': 1.0,
@@ -365,10 +369,10 @@ class RiskEstimation:
     def _get_vulnerability_curve(self, asset_type: str) -> Dict[str, float]:
         """Get vulnerability curve parameters for asset type."""
         vulnerability_curves = {
-            'residential': {'threshold': 0.1, 'slope': 0.8, 'max_damage': 0.9},
-            'commercial': {'threshold': 0.15, 'slope': 0.7, 'max_damage': 0.85},
-            'industrial': {'threshold': 0.2, 'slope': 0.6, 'max_damage': 0.95},
-            'infrastructure': {'threshold': 0.05, 'slope': 0.9, 'max_damage': 0.8}
+            'residential': {'threshold': 0.05, 'slope': 0.8, 'max_damage': 0.9},
+            'commercial': {'threshold': 0.08, 'slope': 0.7, 'max_damage': 0.85},
+            'industrial': {'threshold': 0.1, 'slope': 0.6, 'max_damage': 0.95},
+            'infrastructure': {'threshold': 0.02, 'slope': 0.9, 'max_damage': 0.8}
         }
         
         return vulnerability_curves.get(asset_type, vulnerability_curves['commercial'])
@@ -410,7 +414,7 @@ class RiskEstimation:
         """Calculate loss for a single climate realization."""
         hazard_exposure = self._calculate_hazard_exposure(climate_sample, 'sample')
         
-        vulnerability = self._get_vulnerability_curve(asset.get('asset_type', 'commercial'))
+        vulnerability = self._get_vulnerability_curve(asset.get('type', 'commercial'))
         loss = self._calculate_expected_loss(
             hazard_exposure, vulnerability, asset.get('value', 1.0), 1
         )

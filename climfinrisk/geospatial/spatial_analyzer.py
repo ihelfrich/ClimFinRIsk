@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 import geopandas as gpd
 import xarray as xr
-from shapely.geometry import Point, Polygon
+from shapely.geometry import Point, Polygon, LineString
 import folium
 from folium import plugins
 import matplotlib.pyplot as plt
@@ -38,6 +38,11 @@ class SpatialAnalyzer:
         """
         self.config = config or {}
         self.risk_maps = {}
+        try:
+            from ..data.real_world_sources import RealWorldDataManager
+            self.data_manager = RealWorldDataManager()
+        except ImportError:
+            self.data_manager = None
         
     def analyze_spatial_risk(
         self,
@@ -93,6 +98,7 @@ class SpatialAnalyzer:
     def create_risk_map(
         self,
         risk_data: pd.DataFrame,
+        risk_column: str = 'expected_loss',
         map_type: str = 'choropleth',
         scenario: str = 'rcp85',
         output_path: str = None
@@ -111,9 +117,12 @@ class SpatialAnalyzer:
         """
         logger.info(f"Creating {map_type} risk map for scenario {scenario}")
         
-        risk_column = f'expected_loss_{scenario}'
         if risk_column not in risk_data.columns:
-            risk_column = 'expected_loss_rcp85'  # Fallback
+            scenario_column = f'expected_loss_{scenario}'
+            if scenario_column in risk_data.columns:
+                risk_column = scenario_column
+            else:
+                risk_column = 'expected_loss'  # Fallback
         
         center_lat = risk_data['lat'].mean()
         center_lon = risk_data['lon'].mean()
@@ -132,12 +141,15 @@ class SpatialAnalyzer:
             
         elif map_type == 'bubble':
             max_risk = risk_data[risk_column].max()
+            if max_risk == 0 or pd.isna(max_risk):
+                max_risk = 1.0  # Avoid division by zero
             
             for idx, row in risk_data.iterrows():
                 if pd.isna(row[risk_column]):
                     continue
                 
-                radius = max(5, (row[risk_column] / max_risk) * 50)
+                risk_value = row[risk_column] if not pd.isna(row[risk_column]) else 0
+                radius = max(5, (risk_value / max_risk) * 50)
                 
                 color = self._get_risk_color(row[risk_column], risk_data[risk_column])
                 
@@ -363,7 +375,10 @@ class SpatialAnalyzer:
         sorted_risks = np.sort(risk_values)
         n = len(sorted_risks)
         cumsum = np.cumsum(sorted_risks)
-        gini = (n + 1 - 2 * np.sum(cumsum) / cumsum[-1]) / n
+        if cumsum[-1] == 0 or pd.isna(cumsum[-1]):
+            gini = 0.0
+        else:
+            gini = (n + 1 - 2 * np.sum(cumsum) / cumsum[-1]) / n
         
         risk_shares = risk_values / risk_values.sum()
         hhi = np.sum(risk_shares ** 2)
@@ -371,7 +386,7 @@ class SpatialAnalyzer:
         return {
             'gini_coefficient': gini,
             'herfindahl_hirschman_index': hhi,
-            'top_10_percent_share': risk_values.nlargest(int(0.1 * len(risk_values))).sum() / risk_values.sum()
+            'top_10_percent_share': (risk_values.nlargest(int(0.1 * len(risk_values))).sum() / risk_values.sum()) if risk_values.sum() > 0 else 0.0
         }
     
     def _create_interactive_dashboard(
@@ -405,7 +420,7 @@ class SpatialAnalyzer:
                     
                     folium.CircleMarker(
                         location=[row['lat'], row['lon']],
-                        radius=max(3, (row[risk_column] / gdf[risk_column].max()) * 20),
+                        radius=max(3, (row[risk_column] / max(gdf[risk_column].max(), 1.0)) * 20) if not pd.isna(row[risk_column]) else 3,
                         popup=f"Asset: {row.get('asset_id', 'Unknown')}<br>"
                               f"Scenario: {scenario.upper()}<br>"
                               f"Risk: ${row[risk_column]:,.0f}",
@@ -424,6 +439,23 @@ class SpatialAnalyzer:
         
         return str(dashboard_file)
     
+    def calculate_spatial_statistics(self, assets_data, risk_column='expected_loss'):
+        """Calculate spatial statistics for risk distribution"""
+        gdf = self._create_geodataframe(assets_data)
+        return self._calculate_risk_concentration(gdf)
+    
+    def identify_risk_clusters(self, assets_data, risk_column='expected_loss', n_clusters=5):
+        """Identify spatial risk clusters"""
+        gdf = self._create_geodataframe(assets_data)
+        return self._perform_spatial_clustering(gdf, n_clusters)
+    
+    def create_interactive_dashboard(self, assets_data, risk_column='expected_loss'):
+        """Create interactive risk dashboard"""
+        from pathlib import Path
+        output_path = Path("../outputs/demo_results")
+        output_path.mkdir(parents=True, exist_ok=True)
+        return self._create_interactive_dashboard(assets_data, output_path)
+
     def _get_risk_color(self, risk_value: float, risk_series: pd.Series) -> str:
         """Get color based on risk level."""
         if pd.isna(risk_value):
@@ -448,6 +480,377 @@ class SpatialAnalyzer:
                     font-size:14px; padding: 10px">
         <p><b>Risk Level</b></p>
         <p><i class="fa fa-circle" style="color:green"></i> Low</p>
+    
+    def _get_asset_bbox(self, assets: pd.DataFrame) -> Dict[str, float]:
+        """Extract bounding box from asset coordinates."""
+        return {
+            'min_lat': assets['lat'].min() - 0.1,
+            'max_lat': assets['lat'].max() + 0.1,
+            'min_lon': assets['lon'].min() - 0.1,
+            'max_lon': assets['lon'].max() + 0.1
+        }
+    
+    def _load_real_world_data(self, bbox: Dict[str, float]) -> Dict[str, Any]:
+        """Load real-world geospatial data for the analysis area."""
+        logger.info("Loading real-world geospatial data")
+        
+        if self.data_manager:
+            try:
+                datasets = self.data_manager.load_integrated_dataset(
+                    bbox=bbox,
+                    year=2020,
+                    country_code='USA'
+                )
+                logger.info(f"Loaded {len(datasets)} real-world datasets")
+                return datasets
+            except Exception as e:
+                logger.warning(f"Failed to load some real-world data: {e}")
+        
+        return self._create_synthetic_real_world_data(bbox)
+    
+    def _create_synthetic_real_world_data(self, bbox: Dict[str, float]) -> Dict[str, Any]:
+        """Create synthetic real-world data for demonstration."""
+        logger.info("Creating synthetic real-world data for demonstration")
+        
+        lat_range = np.linspace(bbox['min_lat'], bbox['max_lat'], 50)
+        lon_range = np.linspace(bbox['min_lon'], bbox['max_lon'], 50)
+        
+        population = xr.DataArray(
+            np.random.exponential(100, (50, 50)),
+            coords={'lat': lat_range, 'lon': lon_range},
+            dims=['lat', 'lon'],
+            attrs={'units': 'people per km²', 'source': 'Synthetic WorldPop'}
+        )
+        
+        nightlights = xr.DataArray(
+            np.random.gamma(2, 5, (50, 50)),
+            coords={'lat': lat_range, 'lon': lon_range},
+            dims=['lat', 'lon'],
+            attrs={'units': 'nanoWatts/cm²/sr', 'source': 'Synthetic VIIRS'}
+        )
+        
+        land_cover = xr.DataArray(
+            np.random.choice([10, 20, 30, 40, 50], (50, 50)),
+            coords={'lat': lat_range, 'lon': lon_range},
+            dims=['lat', 'lon'],
+            attrs={'units': 'land cover class', 'source': 'Synthetic Copernicus'}
+        )
+        
+        n_roads = 20
+        road_coords = []
+        for _ in range(n_roads):
+            start_lat = np.random.uniform(bbox['min_lat'], bbox['max_lat'])
+            start_lon = np.random.uniform(bbox['min_lon'], bbox['max_lon'])
+            end_lat = start_lat + np.random.uniform(-0.05, 0.05)
+            end_lon = start_lon + np.random.uniform(-0.05, 0.05)
+            road_coords.append([[start_lon, start_lat], [end_lon, end_lat]])
+        
+        roads_gdf = gpd.GeoDataFrame({
+            'highway': np.random.choice(['primary', 'secondary', 'tertiary'], n_roads),
+            'geometry': [LineString(coords) for coords in road_coords]
+        })
+        
+        return {
+            'population': population,
+            'nightlights': nightlights,
+            'land_cover': land_cover,
+            'roads': roads_gdf
+        }
+    
+    def _enhance_with_real_world_data(
+        self, 
+        gdf: gpd.GeoDataFrame, 
+        real_world_datasets: Dict[str, Any]
+    ) -> gpd.GeoDataFrame:
+        """Enhance asset data with real-world geospatial information."""
+        logger.info("Enhancing asset data with real-world information")
+        
+        enhanced_gdf = gdf.copy()
+        
+        if 'population' in real_world_datasets:
+            pop_data = real_world_datasets['population']
+            enhanced_gdf['population_density'] = enhanced_gdf.apply(
+                lambda row: self._sample_raster_at_point(pop_data, row.geometry.x, row.geometry.y),
+                axis=1
+            )
+        
+        if 'nightlights' in real_world_datasets:
+            lights_data = real_world_datasets['nightlights']
+            enhanced_gdf['nightlight_intensity'] = enhanced_gdf.apply(
+                lambda row: self._sample_raster_at_point(lights_data, row.geometry.x, row.geometry.y),
+                axis=1
+            )
+        
+        if 'land_cover' in real_world_datasets:
+            lc_data = real_world_datasets['land_cover']
+            enhanced_gdf['land_cover_class'] = enhanced_gdf.apply(
+                lambda row: self._sample_raster_at_point(lc_data, row.geometry.x, row.geometry.y),
+                axis=1
+            )
+        
+        if 'roads' in real_world_datasets:
+            roads_gdf = real_world_datasets['roads']
+            enhanced_gdf['distance_to_road'] = enhanced_gdf.apply(
+                lambda row: self._calculate_distance_to_nearest_road(row.geometry, roads_gdf),
+                axis=1
+            )
+        
+        enhanced_gdf['urban_index'] = self._calculate_urban_index(enhanced_gdf)
+        enhanced_gdf['exposure_multiplier'] = self._calculate_exposure_multiplier(enhanced_gdf)
+        
+        return enhanced_gdf
+    
+    def _sample_raster_at_point(self, raster: xr.DataArray, lon: float, lat: float) -> float:
+        """Sample raster value at a specific point."""
+        try:
+            value = raster.sel(lat=lat, lon=lon, method='nearest').values
+            return float(value) if not np.isnan(value) else 0.0
+        except:
+            return 0.0
+    
+    def _calculate_distance_to_nearest_road(self, point, roads_gdf: gpd.GeoDataFrame) -> float:
+        """Calculate distance to nearest road."""
+        if roads_gdf.empty:
+            return 1000.0
+        
+        try:
+            distances = roads_gdf.geometry.distance(point)
+            return float(distances.min()) * 111000
+        except:
+            return 1000.0
+    
+    def _calculate_urban_index(self, gdf: gpd.GeoDataFrame) -> pd.Series:
+        """Calculate urban development index from multiple indicators."""
+        urban_index = pd.Series(0.0, index=gdf.index)
+        
+        if 'population_density' in gdf.columns:
+            pop_norm = (gdf['population_density'] - gdf['population_density'].min()) / \
+                      (gdf['population_density'].max() - gdf['population_density'].min() + 1e-6)
+            urban_index += 0.4 * pop_norm
+        
+        if 'nightlight_intensity' in gdf.columns:
+            lights_norm = (gdf['nightlight_intensity'] - gdf['nightlight_intensity'].min()) / \
+                         (gdf['nightlight_intensity'].max() - gdf['nightlight_intensity'].min() + 1e-6)
+            urban_index += 0.3 * lights_norm
+        
+        if 'distance_to_road' in gdf.columns:
+            road_proximity = 1 / (1 + gdf['distance_to_road'] / 1000)
+            urban_index += 0.3 * road_proximity
+        
+        return urban_index.fillna(0.0)
+    
+    def _calculate_exposure_multiplier(self, gdf: gpd.GeoDataFrame) -> pd.Series:
+        """Calculate exposure multiplier based on real-world factors."""
+        multiplier = pd.Series(1.0, index=gdf.index)
+        
+        if 'urban_index' in gdf.columns:
+            multiplier *= (1 + 0.5 * gdf['urban_index'])
+        
+        if 'land_cover_class' in gdf.columns:
+            lc_multipliers = {10: 1.2, 20: 1.5, 30: 0.8, 40: 0.9, 50: 1.0}
+            multiplier *= gdf['land_cover_class'].map(lc_multipliers).fillna(1.0)
+        
+        return multiplier
+    
+    def _create_enhanced_risk_map(
+        self,
+        gdf: gpd.GeoDataFrame,
+        real_world_datasets: Dict[str, Any],
+        output_path: str
+    ) -> str:
+        """Create enhanced interactive risk map with real-world data layers."""
+        logger.info("Creating enhanced interactive risk map")
+        
+        center_lat = gdf.geometry.y.mean()
+        center_lon = gdf.geometry.x.mean()
+        
+        m = folium.Map(
+            location=[center_lat, center_lon],
+            zoom_start=8,
+            tiles='OpenStreetMap'
+        )
+        
+        folium.TileLayer('CartoDB positron', name='Light Map').add_to(m)
+        folium.TileLayer('CartoDB dark_matter', name='Dark Map').add_to(m)
+        
+        if 'roads' in real_world_datasets:
+            self._add_roads_layer(m, real_world_datasets['roads'])
+        
+        risk_columns = [col for col in gdf.columns if 'expected_loss' in col]
+        if risk_columns:
+            primary_risk = risk_columns[0]
+            
+            for idx, row in gdf.iterrows():
+                risk_value = row[primary_risk]
+                
+                if risk_value > 0:
+                    color = self._get_risk_color(risk_value, gdf[primary_risk].max())
+                    
+                    popup_text = f"""
+                    <b>Asset ID:</b> {row.get('asset_id', idx)}<br>
+                    <b>Risk Value:</b> ${risk_value:,.0f}<br>
+                    <b>Asset Type:</b> {row.get('type', 'Unknown')}<br>
+                    <b>Population Density:</b> {row.get('population_density', 0):.1f}<br>
+                    <b>Nightlight Intensity:</b> {row.get('nightlight_intensity', 0):.1f}<br>
+                    <b>Urban Index:</b> {row.get('urban_index', 0):.2f}<br>
+                    <b>Distance to Road:</b> {row.get('distance_to_road', 0):.0f}m
+                    """
+                    
+                    folium.CircleMarker(
+                        location=[row.geometry.y, row.geometry.x],
+                        radius=max(5, min(20, risk_value / gdf[primary_risk].max() * 20)),
+                        popup=folium.Popup(popup_text, max_width=300),
+                        color=color,
+                        fillColor=color,
+                        fillOpacity=0.7,
+                        weight=2
+                    ).add_to(m)
+        
+        folium.LayerControl().add_to(m)
+        
+        legend_html = self._create_map_legend()
+        m.get_root().html.add_child(folium.Element(legend_html))
+        
+        m.save(output_path)
+        logger.info(f"Enhanced risk map saved to {output_path}")
+        
+        return output_path
+    
+    def _add_roads_layer(self, m: folium.Map, roads_gdf: gpd.GeoDataFrame):
+        """Add roads layer to map."""
+        try:
+            road_colors = {
+                'motorway': '#FF0000',
+                'trunk': '#FF4500',
+                'primary': '#FFA500',
+                'secondary': '#FFFF00',
+                'tertiary': '#90EE90'
+            }
+            
+            for idx, road in roads_gdf.iterrows():
+                coords = [[point[1], point[0]] for point in road.geometry.coords]
+                color = road_colors.get(road.get('highway', 'tertiary'), '#90EE90')
+                
+                folium.PolyLine(
+                    locations=coords,
+                    color=color,
+                    weight=2,
+                    opacity=0.8,
+                    popup=f"Road: {road.get('highway', 'Unknown')}"
+                ).add_to(m)
+                
+        except Exception as e:
+            logger.warning(f"Could not add roads layer: {e}")
+    
+    def _create_live_dashboard(
+        self,
+        gdf: gpd.GeoDataFrame,
+        real_world_datasets: Dict[str, Any],
+        hotspots: Dict[str, Any],
+        clusters: Dict[str, Any],
+        output_path: str
+    ) -> str:
+        """Create comprehensive live dashboard with real-world data integration."""
+        logger.info("Creating live risk dashboard with real-world data")
+        
+        center_lat = gdf.geometry.y.mean()
+        center_lon = gdf.geometry.x.mean()
+        
+        m = folium.Map(
+            location=[center_lat, center_lon],
+            zoom_start=8,
+            tiles='OpenStreetMap'
+        )
+        
+        folium.TileLayer('CartoDB positron', name='Light Map').add_to(m)
+        folium.TileLayer('CartoDB dark_matter', name='Dark Map').add_to(m)
+        folium.TileLayer('Stamen Terrain', name='Terrain').add_to(m)
+        
+        if 'roads' in real_world_datasets:
+            self._add_roads_layer(m, real_world_datasets['roads'])
+        
+        risk_columns = [col for col in gdf.columns if 'expected_loss' in col]
+        
+        for scenario_idx, risk_col in enumerate(risk_columns):
+            scenario_name = risk_col.replace('expected_loss_', '').upper()
+            
+            feature_group = folium.FeatureGroup(name=f'Risk - {scenario_name}')
+            
+            for idx, row in gdf.iterrows():
+                risk_value = row[risk_col]
+                
+                if risk_value > 0:
+                    color = self._get_risk_color(risk_value, gdf[risk_col].max())
+                    
+                    popup_text = f"""
+                    <div style="font-family: Arial, sans-serif;">
+                    <h4>Asset Risk Profile</h4>
+                    <b>Asset ID:</b> {row.get('asset_id', idx)}<br>
+                    <b>Scenario:</b> {scenario_name}<br>
+                    <b>Expected Loss:</b> ${risk_value:,.0f}<br>
+                    <b>Asset Type:</b> {row.get('type', 'Unknown')}<br>
+                    <b>Population Density:</b> {row.get('population_density', 0):.1f}<br>
+                    <b>Nightlight Intensity:</b> {row.get('nightlight_intensity', 0):.1f}<br>
+                    <b>Urban Index:</b> {row.get('urban_index', 0):.2f}<br>
+                    <b>Distance to Road:</b> {row.get('distance_to_road', 0):.0f}m<br>
+                    <b>Exposure Multiplier:</b> {row.get('exposure_multiplier', 1):.2f}
+                    </div>
+                    """
+                    
+                    folium.CircleMarker(
+                        location=[row.geometry.y, row.geometry.x],
+                        radius=max(5, min(20, risk_value / gdf[risk_col].max() * 20)),
+                        popup=folium.Popup(popup_text, max_width=350),
+                        color=color,
+                        fillColor=color,
+                        fillOpacity=0.7,
+                        weight=2
+                    ).add_to(feature_group)
+            
+            feature_group.add_to(m)
+        
+        folium.LayerControl().add_to(m)
+        
+        legend_html = self._create_enhanced_legend()
+        m.get_root().html.add_child(folium.Element(legend_html))
+        
+        m.save(output_path)
+        logger.info(f"Live dashboard saved to {output_path}")
+        
+        return output_path
+    
+    def _create_enhanced_legend(self) -> str:
+        """Create enhanced legend for live dashboard."""
+        return """
+        <div style='position: fixed; 
+                    bottom: 50px; left: 50px; width: 300px; height: 200px; 
+                    background-color: white; border:2px solid grey; z-index:9999; 
+                    font-size:14px; padding: 10px'>
+        <h4>Climate Risk Dashboard</h4>
+        <p><b>Risk Levels:</b></p>
+        <p><i class="fa fa-circle" style="color:green"></i> Low Risk</p>
+        <p><i class="fa fa-circle" style="color:yellow"></i> Medium Risk</p>
+        <p><i class="fa fa-circle" style="color:orange"></i> High Risk</p>
+        <p><i class="fa fa-circle" style="color:red"></i> Critical Risk</p>
+        <p><b>Data Sources:</b> WorldPop, VIIRS, OSM, Copernicus</p>
+        </div>
+        """
+    
+    def _create_map_legend(self) -> str:
+        """Create map legend."""
+        return """
+        <div style='position: fixed; 
+                    bottom: 50px; left: 50px; width: 200px; height: 120px; 
+                    background-color: white; border:2px solid grey; z-index:9999; 
+                    font-size:14px; padding: 10px'>
+        <h4>Risk Map Legend</h4>
+        <p><i class="fa fa-circle" style="color:green"></i> Low Risk</p>
+        <p><i class="fa fa-circle" style="color:yellow"></i> Medium Risk</p>
+        <p><i class="fa fa-circle" style="color:orange"></i> High Risk</p>
+        <p><i class="fa fa-circle" style="color:red"></i> Critical Risk</p>
+        </div>
+        """
+
         <p><i class="fa fa-circle" style="color:orange"></i> Medium</p>
         <p><i class="fa fa-circle" style="color:red"></i> High</p>
         </div>

@@ -257,8 +257,8 @@ class DataIngestion:
         np.random.seed(42)  # For reproducibility
         
         if hazard == 'flood':
-            intensity = np.random.exponential(0.2, (len(times), len(lats), len(lons)))
-            intensity = np.clip(intensity, 0, 1)
+            intensity = np.random.exponential(0.5, (len(times), len(lats), len(lons)))
+            intensity = np.clip(intensity, 0, 2.0)
             
             frequency = np.random.poisson(2, (len(times), len(lats), len(lons)))
             
@@ -341,7 +341,7 @@ class DataIngestion:
             'asset_id': [f'ASSET_{i:04d}' for i in range(n_assets)],
             'lat': lats,
             'lon': lons,
-            'asset_type': types,
+            'type': types,
             'value': values,
             'construction_year': np.random.randint(1950, 2020, n_assets),
             'building_material': np.random.choice(['concrete', 'steel', 'wood', 'mixed'], n_assets)
